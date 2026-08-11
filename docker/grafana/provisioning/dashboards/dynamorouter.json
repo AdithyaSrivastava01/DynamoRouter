@@ -1,0 +1,43 @@
+{
+  "title": "DynamoRouter",
+  "uid": "dynamorouter",
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1, "title": "Cache hit rate (ground truth)", "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "max": 1, "min": 0 } },
+      "targets": [{
+        "expr": "sum(rate(replica_cached_blocks_total[1m])) / sum(rate(replica_total_blocks_total[1m]))",
+        "legendFormat": "hit rate"
+      }]
+    },
+    {
+      "id": 2, "title": "Routing overhead P99", "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [{
+        "expr": "histogram_quantile(0.99, rate(router_routing_overhead_seconds_bucket[1m]))",
+        "legendFormat": "p99"
+      }]
+    },
+    {
+      "id": 3, "title": "Requests/sec", "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [{
+        "expr": "rate(router_requests_total[1m])",
+        "legendFormat": "req/s"
+      }]
+    },
+    {
+      "id": 4, "title": "In-flight per replica", "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [{
+        "expr": "router_replica_inflight",
+        "legendFormat": "replica {{replica}}"
+      }]
+    }
+  ],
+  "schemaVersion": 39
+}

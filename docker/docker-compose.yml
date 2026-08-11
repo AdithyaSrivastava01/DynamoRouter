@@ -1,0 +1,59 @@
+x-mock: &mock
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+  entrypoint: ["/usr/local/bin/mock-triton"]
+  environment:
+    PORT: "8001"
+    METRICS_PORT: "9101"
+    CACHE_BLOCKS: "4096"
+    PREFILL_US_PER_TOKEN: "200"
+
+services:
+  router:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "8000:8000"
+      - "9100:9100"
+    environment:
+      PORT: "8000"
+      METRICS_PORT: "9100"
+      REPLICAS: "http://mock1:8001,http://mock2:8001,http://mock3:8001,http://mock4:8001,http://mock5:8001,http://mock6:8001,http://mock7:8001,http://mock8:8001"
+      POLICY: "${POLICY:-cache-aware}"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4317"
+    depends_on: [mock1, mock2, mock3, mock4, mock5, mock6, mock7, mock8]
+
+  mock1: *mock
+  mock2: *mock
+  mock3: *mock
+  mock4: *mock
+  mock5: *mock
+  mock6: *mock
+  mock7: *mock
+  mock8: *mock
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000"
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.58
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
