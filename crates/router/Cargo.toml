@@ -20,3 +20,4 @@ rustc-hash = { workspace = true }
 
 [dev-dependencies]
 mock-triton = { path = "../mock-triton" }
+tokio-stream = { version = "0.1", features = ["net"] }
