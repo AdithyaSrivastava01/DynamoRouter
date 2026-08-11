@@ -1939,6 +1939,13 @@ git add -A
 git commit -m "feat(router): cache-aware unary proxy with backpressure + integration tests"
 ```
 
+**Post-review amendments (applied):** a quality review after Tasks 9–10 landed required a follow-up fix commit. The code samples above are the original shape; the following changed and any later task's plan text that assumes the original shape (struct-literal `RouterInner { .. }` construction, `Scheduler::pick` returning `Option`) needs the adjustments below instead:
+
+- **#1 streaming health marking:** in `model_stream_infer`'s upstream *connect* failure arm (`Err(status)` from `client.model_stream_infer(..)`), if `status.code() == Code::Unavailable`, call `inner.mark_unhealthy(decision.replica)` before sending the `error_message` chunk — the original streaming handler never marked replicas unhealthy. Mid-stream errors (failure while reading response chunks) intentionally stay as-is: no replay, no health marking.
+- **#2 gauge/lock overhead:** `RouteDecision` gained a field `inflight_after: usize` (the replica's inflight count immediately after the pick), so `route`/`pick_replica` no longer takes a second scheduler-mutex lock just to read the gauge value. `RouterInner` gained `replica_inflight_gauges: Vec<IntGauge>`, pre-resolved once via `with_label_values` in a new `RouterInner::new(scheduler, clients, tokenizer, metrics)` constructor — **use this constructor, not the struct literal**, anywhere `RouterInner { scheduler: Mutex::new(..), clients, tokenizer, metrics }` appears in later plan text (Task 11's `spawn_router_lazy` test helper and `main.rs`).
+- **#3 metric double-counting:** `route()` was split into `hash_prompt` (tokenize + block-hash, called once per request, not once per retry attempt) and `pick_replica` (scheduler lock + `pick` + routing-overhead observation, called once per attempt). `requests_total`/`matched_blocks_total`/`prompt_blocks_total` moved into a `record_served(prompt_blocks, decision)` helper, invoked exactly once per request — using the decision that actually served it (the successful attempt for unary; the single non-retried attempt for streaming) — instead of once per attempt inside the old `route()`.
+- **#7 saturation vs. no-healthy-replicas:** `Scheduler::pick` now returns `Result<RouteDecision, PickError>` (`PickError::NoHealthyReplicas` | `PickError::AllSaturated`) instead of `Option<RouteDecision>`. The router maps `NoHealthyReplicas` → `Status::unavailable(..)` and `AllSaturated` → `Status::resource_exhausted(..)`. Any later plan text pattern-matching `sched.pick(&hashes)` as an `Option` (`.is_none()`, `Some`/`None`) needs to match on `Result`/`PickError` instead.
+
 ---
 
 ### Task 10: Router streaming passthrough
@@ -2165,17 +2172,17 @@ async fn spawn_router_lazy(
             GrpcInferenceServiceClient::new(channel)
         })
         .collect();
+    // NOTE (post-review amendment #2): RouterInner is built via its
+    // `new(..)` constructor, not a struct literal — it pre-resolves one
+    // inflight gauge per replica from `clients.len()`, which a literal
+    // `RouterInner { scheduler: Mutex::new(..), .. }` would skip.
     let svc = RouterService {
-        inner: Arc::new(router::server::RouterInner {
-            scheduler: Mutex::new(Scheduler::new(
-                replica_urls.len(),
-                policy,
-                SchedulerConfig::default(),
-            )),
+        inner: Arc::new(router::server::RouterInner::new(
+            Scheduler::new(replica_urls.len(), policy, SchedulerConfig::default()),
             clients,
-            tokenizer: PromptTokenizer::from_file(TOKENIZER).unwrap(),
-            metrics: Metrics::new(),
-        }),
+            PromptTokenizer::from_file(TOKENIZER).unwrap(),
+            Metrics::new(),
+        )),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -2252,7 +2259,7 @@ pub fn spawn_health_prober(
 
 `crates/router/src/main.rs`:
 ```rust
-use std::sync::{Arc, Mutex};
+use std::sync::Arc; // `RouterInner::new` owns the Mutex internally now (amendment #2)
 
 use clap::Parser;
 use prometheus::TextEncoder;
@@ -2317,12 +2324,14 @@ async fn main() -> anyhow::Result<()> {
         })
         .collect();
 
-    let inner = Arc::new(RouterInner {
-        scheduler: Mutex::new(Scheduler::new(args.replicas.len(), policy, cfg)),
+    // Post-review amendment #2: use the `RouterInner::new(..)` constructor
+    // (pre-resolves per-replica inflight gauges), not a struct literal.
+    let inner = Arc::new(RouterInner::new(
+        Scheduler::new(args.replicas.len(), policy, cfg),
         clients,
-        tokenizer: PromptTokenizer::from_file(&args.tokenizer_path)?,
-        metrics: Metrics::new(),
-    });
+        PromptTokenizer::from_file(&args.tokenizer_path)?,
+        Metrics::new(),
+    ));
 
     spawn_health_prober(Arc::clone(&inner), std::time::Duration::from_secs(2));
 

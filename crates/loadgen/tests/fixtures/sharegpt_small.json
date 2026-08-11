@@ -1,0 +1,18 @@
+[
+  {
+    "id": "conv1",
+    "conversations": [
+      { "from": "human", "value": "What is Rust?" },
+      { "from": "gpt", "value": "A systems programming language." },
+      { "from": "human", "value": "Why is it fast?" },
+      { "from": "gpt", "value": "No GC, zero-cost abstractions." }
+    ]
+  },
+  {
+    "id": "conv2",
+    "conversations": [
+      { "from": "human", "value": "Hello" },
+      { "from": "gpt", "value": "Hi there" }
+    ]
+  }
+]
