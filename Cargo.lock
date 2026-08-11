@@ -784,6 +784,7 @@ dependencies = [
  "prometheus",
  "prost",
  "protocol",
+ "rustc-hash",
  "tokenizers",
  "tokio",
  "tokio-stream",

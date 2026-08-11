@@ -99,22 +99,31 @@ impl MockTritonService {
             .map_err(|_| Status::invalid_argument("text_input not utf8"))
     }
 
-    /// Simulate prefill: returns (cached_blocks, total_blocks) and sleeps for
-    /// time proportional to uncached tokens.
-    async fn prefill(&self, text: &str) -> Result<(usize, usize), Status> {
-        let ids = self
-            .tokenizer
+    /// Simulate prefill: tokenizes `text`, looks it up in `cache`, records
+    /// metrics, and sleeps for time proportional to *uncached* tokens.
+    /// Returns `(cached_blocks, total_blocks)`. Shared by the unary and
+    /// streaming paths so a tokenizer error is reported identically by
+    /// both instead of silently degrading into an empty-token request (as
+    /// the streaming path used to do when this logic was duplicated).
+    async fn simulate_prefill(
+        tokenizer: &tokenizers::Tokenizer,
+        cache: &Mutex<crate::cache::KvCacheSim>,
+        metrics: &MockMetrics,
+        cfg: &MockConfig,
+        text: &str,
+    ) -> Result<(usize, usize), Status> {
+        let ids = tokenizer
             .encode(text, false)
             .map_err(|e| Status::invalid_argument(format!("tokenize: {e}")))?
             .get_ids()
             .to_vec();
         let hashes = block_hashes(&ids);
         let total = hashes.len();
-        let cached = self.cache.lock().unwrap().lookup_insert(&hashes);
-        self.metrics.cached_blocks_total.inc_by(cached as u64);
-        self.metrics.total_blocks_total.inc_by(total as u64);
+        let cached = cache.lock().unwrap().lookup_insert(&hashes);
+        metrics.cached_blocks_total.inc_by(cached as u64);
+        metrics.total_blocks_total.inc_by(total as u64);
         let uncached_tokens = ids.len().saturating_sub(cached * BLOCK_SIZE);
-        let delay = Duration::from_micros(uncached_tokens as u64 * self.cfg.prefill_us_per_token);
+        let delay = Duration::from_micros(uncached_tokens as u64 * cfg.prefill_us_per_token);
         tokio::time::sleep(delay).await;
         Ok((cached, total))
     }
@@ -194,7 +203,14 @@ impl GrpcInferenceService for MockTritonService {
     ) -> Result<Response<pb::ModelInferResponse>, Status> {
         let req = request.into_inner();
         let text = Self::extract_text(&req)?;
-        let (cached, total) = self.prefill(&text).await?;
+        let (cached, total) = Self::simulate_prefill(
+            &self.tokenizer,
+            &self.cache,
+            &self.metrics,
+            &self.cfg,
+            &text,
+        )
+        .await?;
         Ok(Response::new(Self::make_response(
             &req,
             cached,
@@ -219,6 +235,12 @@ impl GrpcInferenceService for MockTritonService {
         let metrics = Arc::clone(&self.metrics);
 
         tokio::spawn(async move {
+            // The router opens one stream per request, so in practice this
+            // loop processes exactly one request per stream; it stays a
+            // loop (rather than a single read) to tolerate a client that
+            // reuses the stream, which is served serially by design — the
+            // next message isn't read until the current one's decode loop
+            // finishes.
             while let Some(msg) = inbound.next().await {
                 let req = match msg {
                     Ok(r) => r,
@@ -244,21 +266,19 @@ impl GrpcInferenceService for MockTritonService {
                         continue;
                     }
                 };
-                // prefill (inline, since we own Arc handles here)
-                let ids = match tokenizer.encode(text.as_str(), false) {
-                    Ok(enc) => enc.get_ids().to_vec(),
-                    Err(_) => Vec::new(),
-                };
-                let hashes = block_hashes(&ids);
-                let total = hashes.len();
-                let cached = cache.lock().unwrap().lookup_insert(&hashes);
-                metrics.cached_blocks_total.inc_by(cached as u64);
-                metrics.total_blocks_total.inc_by(total as u64);
-                let uncached = ids.len().saturating_sub(cached * BLOCK_SIZE);
-                tokio::time::sleep(Duration::from_micros(
-                    uncached as u64 * cfg.prefill_us_per_token,
-                ))
-                .await;
+                let (cached, total) =
+                    match Self::simulate_prefill(&tokenizer, &cache, &metrics, &cfg, &text).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = tx
+                                .send(Ok(pb::ModelStreamInferResponse {
+                                    error_message: e.to_string(),
+                                    infer_response: None,
+                                }))
+                                .await;
+                            continue;
+                        }
+                    };
 
                 for chunk in 0..cfg.decode_chunks {
                     tokio::time::sleep(Duration::from_millis(cfg.decode_interval_ms)).await;
@@ -283,5 +303,97 @@ impl GrpcInferenceService for MockTritonService {
         });
 
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::Instant;
+
+    const TOKENIZER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/tokenizer.json");
+
+    fn load_tokenizer() -> tokenizers::Tokenizer {
+        tokenizers::Tokenizer::from_file(TOKENIZER).unwrap()
+    }
+
+    // Long enough to guarantee at least one full 16-token block regardless
+    // of exact tokenization.
+    fn long_prompt() -> String {
+        "the quick brown fox jumps over the lazy dog ".repeat(3)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cold_prefill_sleeps_proportional_to_uncached_tokens() {
+        let tokenizer = load_tokenizer();
+        let cfg = MockConfig {
+            prefill_us_per_token: 1000,
+            ..Default::default()
+        };
+        let cache = Mutex::new(crate::cache::KvCacheSim::new(cfg.cache_blocks));
+        let metrics = MockMetrics::new();
+
+        let text = long_prompt();
+        let ids = tokenizer
+            .encode(text.as_str(), false)
+            .unwrap()
+            .get_ids()
+            .to_vec();
+        assert!(!ids.is_empty(), "test prompt tokenized to nothing");
+
+        let start = Instant::now();
+        let (cached, total) =
+            MockTritonService::simulate_prefill(&tokenizer, &cache, &metrics, &cfg, &text)
+                .await
+                .unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(cached, 0); // cold: nothing was cached yet
+        assert!(total >= 1, "prompt should span at least one full block");
+        // Every token is uncached on a cold prefix, so the virtual sleep
+        // must equal ids.len() * prefill_us_per_token exactly.
+        assert_eq!(
+            elapsed,
+            Duration::from_micros(ids.len() as u64 * cfg.prefill_us_per_token)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn warm_prefill_only_sleeps_for_the_uncached_remainder() {
+        let tokenizer = load_tokenizer();
+        let cfg = MockConfig {
+            prefill_us_per_token: 1000,
+            ..Default::default()
+        };
+        let cache = Mutex::new(crate::cache::KvCacheSim::new(cfg.cache_blocks));
+        let metrics = MockMetrics::new();
+
+        let text = long_prompt();
+        let ids = tokenizer
+            .encode(text.as_str(), false)
+            .unwrap()
+            .get_ids()
+            .to_vec();
+        let hashes = block_hashes(&ids);
+        assert!(!hashes.is_empty(), "test prompt too short for a full block");
+        // Pre-warm the cache directly (no simulated delay) so the first
+        // simulate_prefill call below already finds a warm prefix.
+        cache.lock().unwrap().lookup_insert(&hashes);
+
+        let start = Instant::now();
+        let (cached, total) =
+            MockTritonService::simulate_prefill(&tokenizer, &cache, &metrics, &cfg, &text)
+                .await
+                .unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(cached, total); // the whole hashed prefix is warm
+                                   // Only the sub-block remainder (tokens past the last full block,
+                                   // never hashed/cached) should incur delay.
+        let remainder_tokens = ids.len() - total * BLOCK_SIZE;
+        assert_eq!(
+            elapsed,
+            Duration::from_micros(remainder_tokens as u64 * cfg.prefill_us_per_token)
+        );
     }
 }

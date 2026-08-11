@@ -24,6 +24,8 @@ tracing-subscriber = { workspace = true }
 prometheus = { workspace = true }
 axum = { workspace = true }
 tokenizers = { workspace = true }
+rustc-hash = { workspace = true }
 
 [dev-dependencies]
 tokio-stream = { version = "0.1", features = ["net"] }
+tokio = { workspace = true, features = ["test-util"] }

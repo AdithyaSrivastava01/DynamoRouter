@@ -106,6 +106,24 @@ async fn model_infer_reports_cold_then_warm_cache() {
 }
 
 #[tokio::test]
+async fn model_infer_missing_text_tensor_returns_invalid_argument() {
+    let cfg = MockConfig {
+        tokenizer_path: TOKENIZER.into(),
+        prefill_us_per_token: 0,
+        ..Default::default()
+    };
+    let (url, _handle) = spawn_service(cfg).await;
+    let mut client = GrpcInferenceServiceClient::connect(url).await.unwrap();
+
+    let req = pb::ModelInferRequest {
+        model_name: "mock".into(),
+        ..Default::default() // no inputs at all
+    };
+    let err = client.model_infer(req).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+}
+
+#[tokio::test]
 async fn model_stream_infer_emits_configured_chunk_count_with_params_on_last() {
     let cfg = MockConfig {
         tokenizer_path: TOKENIZER.into(),
