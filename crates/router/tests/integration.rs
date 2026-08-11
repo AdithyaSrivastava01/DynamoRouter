@@ -3,7 +3,7 @@ use std::sync::Arc;
 use protocol::pb;
 use protocol::{GrpcInferenceServiceClient, GrpcInferenceServiceServer};
 use router::scheduler::{Policy, Scheduler, SchedulerConfig};
-use router::server::{RouterInner, RouterService};
+use router::server::{spawn_health_prober, RouterInner, RouterService};
 use router::telemetry::Metrics;
 use router::tokenizer::PromptTokenizer;
 
@@ -189,4 +189,87 @@ async fn streaming_forwards_chunks() {
         .unwrap()
         .parameters
         .contains_key("cached_blocks"));
+}
+
+#[tokio::test]
+async fn failover_retries_on_dead_replica() {
+    // one real mock + one dead endpoint that accepts TCP then closes
+    let (m1, _h1) = spawn_mock(0).await;
+    let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_url = format!("http://{}", dead_listener.local_addr().unwrap());
+    let dead_handle = tokio::spawn(async move {
+        loop {
+            let Ok((sock, _)) = dead_listener.accept().await else {
+                break;
+            };
+            drop(sock); // slam the door: transport error upstream
+        }
+    });
+
+    // spawn_router already uses connect_lazy, so startup doesn't fail on
+    // the dead endpoint.
+    let (router_url, _rh) = spawn_router(&[dead_url, m1], Policy::RoundRobin).await;
+    let mut client = GrpcInferenceServiceClient::connect(router_url)
+        .await
+        .unwrap();
+
+    // RoundRobin starts at replica 0 (dead) -> transport error -> retry
+    // lands on replica 1.
+    let resp = client
+        .model_infer(infer_request(&long_prompt("failover")))
+        .await;
+    assert!(
+        resp.is_ok(),
+        "retry should succeed on healthy replica: {resp:?}"
+    );
+    dead_handle.abort();
+}
+
+#[tokio::test]
+async fn health_prober_marks_dead_replica_unhealthy() {
+    // Direct RouterInner + spawn_health_prober test, no router HTTP server
+    // needed: cheap because it exercises the prober loop against a real
+    // dead TCP endpoint and a real mock, without going through gRPC twice.
+    let (m1, _h1) = spawn_mock(0).await;
+    let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_url = format!("http://{}", dead_listener.local_addr().unwrap());
+    let dead_handle = tokio::spawn(async move {
+        loop {
+            let Ok((sock, _)) = dead_listener.accept().await else {
+                break;
+            };
+            drop(sock);
+        }
+    });
+
+    let clients: Vec<_> = [dead_url, m1]
+        .iter()
+        .map(|url| {
+            let channel = tonic::transport::Endpoint::from_shared(url.clone())
+                .unwrap()
+                .connect_lazy();
+            GrpcInferenceServiceClient::new(channel)
+        })
+        .collect();
+    let inner = Arc::new(RouterInner::new(
+        Scheduler::new(2, Policy::RoundRobin, SchedulerConfig::default()),
+        clients,
+        PromptTokenizer::from_file(TOKENIZER).unwrap(),
+        Metrics::new(),
+    ));
+
+    let prober = spawn_health_prober(Arc::clone(&inner), std::time::Duration::from_millis(50));
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    prober.abort();
+    dead_handle.abort();
+
+    assert!(
+        !inner.scheduler.lock().unwrap().is_healthy(0),
+        "dead replica should be marked unhealthy"
+    );
+    assert!(
+        inner.scheduler.lock().unwrap().is_healthy(1),
+        "live replica should stay healthy"
+    );
+    assert_eq!(inner.metrics.healthy_replicas.get(), 1);
 }

@@ -196,7 +196,7 @@ impl GrpcInferenceService for RouterService {
                 self.inner.record_served(hashes.len(), &decision);
                 return Ok(resp);
             }
-            Err(status) if status.code() == tonic::Code::Unavailable => {
+            Err(status) if is_transport_failure(&status) => {
                 self.inner.mark_unhealthy(decision.replica);
             }
             Err(status) => return Err(status), // app-level error: propagate
@@ -213,7 +213,7 @@ impl GrpcInferenceService for RouterService {
                 self.inner.record_served(hashes.len(), &decision);
                 Ok(resp)
             }
-            Err(status) if status.code() == tonic::Code::Unavailable => {
+            Err(status) if is_transport_failure(&status) => {
                 self.inner.mark_unhealthy(decision.replica);
                 Err(status)
             }
@@ -328,7 +328,7 @@ impl GrpcInferenceService for RouterService {
                         // a transport-level failure like the unary path's,
                         // so mark the replica unhealthy the same way,
                         // before reporting it to the client.
-                        if status.code() == tonic::Code::Unavailable {
+                        if is_transport_failure(&status) {
                             inner.mark_unhealthy(decision.replica);
                         }
                         let _ = tx
@@ -349,6 +349,64 @@ impl GrpcInferenceService for RouterService {
     }
 }
 
+/// Probe `ServerLive` on every replica every `interval`, flipping each
+/// replica's health state in the scheduler and updating the
+/// `healthy_replicas` gauge. Runs until the process exits.
+pub fn spawn_health_prober(
+    inner: Arc<RouterInner>,
+    interval: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+            let n = inner.clients.len();
+            let mut healthy_count = 0i64;
+            for i in 0..n {
+                let mut client = inner.clients[i].clone();
+                let live = matches!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(1),
+                        client.server_live(pb::ServerLiveRequest {}),
+                    )
+                    .await,
+                    Ok(Ok(resp)) if resp.get_ref().live
+                );
+                let mut sched = inner.scheduler.lock().unwrap();
+                if live {
+                    if !sched.is_healthy(i) {
+                        tracing::info!(replica = i, "replica re-admitted");
+                    }
+                    sched.mark_healthy(i);
+                    healthy_count += 1;
+                } else if sched.is_healthy(i) {
+                    tracing::warn!(replica = i, "replica marked unhealthy");
+                    sched.mark_unhealthy(i);
+                }
+            }
+            inner.metrics.healthy_replicas.set(healthy_count);
+        }
+    })
+}
+
 fn fmt_status(status: &Status) -> String {
     format!("{}: {}", status.code(), status.message())
+}
+
+/// Whether `status` indicates the upstream connection/transport itself
+/// failed (dead replica, reset connection, etc.) rather than an
+/// application-level error from a live replica. Observed empirically: a
+/// TCP endpoint that accepts then immediately closes the connection
+/// surfaces to the client as `Cancelled`, not `Unavailable` — tonic/h2
+/// report the stream as canceled when the connection resets before the
+/// request completes. `Unknown` and `Internal` are included as other
+/// transport-shaped failure modes seen from broken/misbehaving peers.
+fn is_transport_failure(status: &Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::Unavailable
+            | tonic::Code::Unknown
+            | tonic::Code::Internal
+            | tonic::Code::Cancelled
+    )
 }
