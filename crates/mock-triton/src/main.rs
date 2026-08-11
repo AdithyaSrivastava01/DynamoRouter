@@ -47,18 +47,14 @@ async fn main() -> anyhow::Result<()> {
         }),
     );
     let metrics_addr = std::net::SocketAddr::from(([0, 0, 0, 0], args.metrics_port));
+    // Bind before spawning: an in-use metrics port should fail startup
+    // loudly and immediately, not vanish as a panic inside a detached task
+    // sometime after main() has already moved on.
+    let metrics_listener = tokio::net::TcpListener::bind(metrics_addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to bind metrics listener on {metrics_addr}: {e}"))?;
     tokio::spawn(async move {
-        // A replica whose metrics endpoint is down is unobservable to the
-        // benchmark/compose stack; fail loudly instead of an unwrap panic
-        // buried in a detached task (which would just silently vanish).
-        let listener = match tokio::net::TcpListener::bind(metrics_addr).await {
-            Ok(listener) => listener,
-            Err(e) => {
-                tracing::error!("failed to bind metrics listener on {metrics_addr}: {e}");
-                std::process::exit(1);
-            }
-        };
-        if let Err(e) = axum::serve(listener, metrics_app).await {
+        if let Err(e) = axum::serve(metrics_listener, metrics_app).await {
             tracing::error!("metrics server exited: {e}");
             std::process::exit(1);
         }

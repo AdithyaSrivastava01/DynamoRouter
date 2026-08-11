@@ -7,7 +7,12 @@ pub struct PromptTokenizer {
 
 impl PromptTokenizer {
     pub fn from_file(path: &str) -> Result<Self> {
-        let inner = Tokenizer::from_file(path).map_err(|e| anyhow!("load tokenizer: {e}"))?;
+        let inner = Tokenizer::from_file(path).map_err(|e| {
+            anyhow!(
+                "load tokenizer from {path}: {e}\n\
+                 hint: fetch it with `./scripts/fetch_tokenizer.sh data`"
+            )
+        })?;
         Ok(Self { inner })
     }
 

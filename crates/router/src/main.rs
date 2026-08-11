@@ -1,5 +1,7 @@
 use std::sync::Arc;
+use std::time::Duration;
 
+use anyhow::Context;
 use clap::Parser;
 use prometheus::TextEncoder;
 use protocol::{GrpcInferenceServiceClient, GrpcInferenceServiceServer};
@@ -31,6 +33,40 @@ struct Args {
     block_budget: usize,
     #[arg(long, env = "MAX_INFLIGHT", default_value_t = 512)]
     max_inflight: usize,
+    /// Per-request timeout for calls to a replica, in seconds. A request
+    /// that exceeds this is a DeadlineExceeded, which the router
+    /// deliberately does NOT retry (see `is_transport_failure` in
+    /// server.rs) — it just fails the request rather than risking double
+    /// compute on a replica that's merely slow.
+    #[arg(long, env = "UPSTREAM_TIMEOUT_S", default_value_t = 30)]
+    upstream_timeout_s: u64,
+}
+
+/// Resolves when either Ctrl+C (SIGINT) or SIGTERM is received, so the
+/// server can drain in-flight requests before exiting under both a local
+/// `Ctrl+C` and an orchestrator-issued SIGTERM (docker stop, k8s pod
+/// termination, etc).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("received Ctrl+C, shutting down"),
+        _ = terminate => tracing::info!("received SIGTERM, shutting down"),
+    }
 }
 
 #[tokio::main]
@@ -52,16 +88,20 @@ async fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
 
+    let upstream_timeout = Duration::from_secs(args.upstream_timeout_s);
     let clients: Vec<_> = args
         .replicas
         .iter()
         .map(|url| {
             let channel = Endpoint::from_shared(url.clone())
-                .expect("bad replica url")
+                .with_context(|| format!("bad replica url: {url}"))?
+                .timeout(upstream_timeout)
+                .connect_timeout(Duration::from_secs(5))
+                .tcp_keepalive(Some(Duration::from_secs(30)))
                 .connect_lazy();
-            GrpcInferenceServiceClient::new(channel)
+            anyhow::Ok(GrpcInferenceServiceClient::new(channel))
         })
-        .collect();
+        .collect::<anyhow::Result<_>>()?;
 
     let inner = Arc::new(RouterInner::new(
         Scheduler::new(args.replicas.len(), policy, cfg),
@@ -85,16 +125,27 @@ async fn main() -> anyhow::Result<()> {
         }),
     );
     let metrics_addr = std::net::SocketAddr::from(([0, 0, 0, 0], args.metrics_port));
+    // Bind before spawning: an in-use metrics port should fail router
+    // startup loudly, not vanish as a silent panic inside a detached task.
+    let metrics_listener = tokio::net::TcpListener::bind(metrics_addr)
+        .await
+        .with_context(|| format!("failed to bind metrics listener on {metrics_addr}"))?;
     tokio::spawn(async move {
-        let listener = tokio::net::TcpListener::bind(metrics_addr).await.unwrap();
-        axum::serve(listener, metrics_app).await.unwrap();
+        if let Err(e) = axum::serve(metrics_listener, metrics_app).await {
+            tracing::error!("metrics server exited: {e}");
+            std::process::exit(1);
+        }
     });
 
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], args.port));
     tracing::info!(%addr, policy = args.policy, replicas = args.replicas.len(), "router up");
     tonic::transport::Server::builder()
         .add_service(GrpcInferenceServiceServer::new(RouterService { inner }))
-        .serve(addr)
+        .serve_with_shutdown(addr, shutdown_signal())
         .await?;
+
+    // Flush any spans still buffered in the OTel batch exporter before the
+    // process exits.
+    router::telemetry::shutdown_tracing();
     Ok(())
 }

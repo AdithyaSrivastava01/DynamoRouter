@@ -84,9 +84,19 @@ pub fn init_tracing() {
         use opentelemetry_otlp::WithExportConfig;
         let exporter = opentelemetry_otlp::SpanExporter::builder()
             .with_tonic()
-            .with_endpoint(endpoint)
+            .with_endpoint(endpoint.clone())
             .build()
-            .expect("otlp exporter");
+            .unwrap_or_else(|e| {
+                // This only fails on a malformed endpoint/config (e.g. bad
+                // URI), not on the collector being unreachable — that
+                // failure mode is async/lazy in the batch exporter and
+                // wouldn't show up here. Panicking with the offending
+                // endpoint value is a deliberate choice for a
+                // configuration-time error: it's process startup, so
+                // failing loudly with actionable detail beats limping
+                // along with tracing silently disabled.
+                panic!("failed to build OTLP exporter for endpoint {endpoint:?}: {e}")
+            });
         let provider = opentelemetry_sdk::trace::TracerProvider::builder()
             .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
             .with_resource(opentelemetry_sdk::Resource::new(vec![
@@ -107,4 +117,14 @@ pub fn init_tracing() {
             .with(fmt_layer)
             .init();
     }
+}
+
+/// Flush and shut down the global OTel tracer provider, if one was
+/// installed by [`init_tracing`]. Harmless no-op when OTel was never
+/// initialized (the OTEL_EXPORTER_OTLP_ENDPOINT branch never ran). Call
+/// this after the server has stopped accepting new requests but before
+/// process exit, so any spans still buffered in the batch exporter get a
+/// chance to ship instead of being dropped on the floor.
+pub fn shutdown_tracing() {
+    opentelemetry::global::shutdown_tracer_provider();
 }

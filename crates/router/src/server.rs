@@ -20,10 +20,9 @@ use crate::tokenizer::PromptTokenizer;
 
 pub struct RouterInner {
     pub scheduler: Mutex<Scheduler>,
-    // TODO(task 11): replica `Channel`s are built with plain `connect_lazy`
-    // in main.rs; they should also get a send-timeout and keepalive via
-    // `Endpoint` so a wedged (not dead) replica can't hang a request
-    // indefinitely. Not wired up yet.
+    /// gRPC clients for each replica. Channels are built in main.rs with
+    /// `Endpoint::timeout` / `connect_timeout` / `tcp_keepalive` set, so a
+    /// wedged (not dead) replica can't hang a request indefinitely.
     pub clients: Vec<GrpcInferenceServiceClient<Channel>>,
     pub tokenizer: PromptTokenizer,
     pub metrics: Metrics,
@@ -142,47 +141,15 @@ pub struct RouterService {
     pub inner: Arc<RouterInner>,
 }
 
-#[tonic::async_trait]
-impl GrpcInferenceService for RouterService {
-    async fn server_live(
+impl RouterService {
+    /// The unary routing/retry logic, run inside the `model_infer` parent
+    /// span (see the trait method below) so the `route_decision` and
+    /// `upstream_infer` child spans from both attempts land in one trace
+    /// instead of two disconnected roots.
+    async fn model_infer_attempts(
         &self,
-        _: Request<pb::ServerLiveRequest>,
-    ) -> Result<Response<pb::ServerLiveResponse>, Status> {
-        Ok(Response::new(pb::ServerLiveResponse { live: true }))
-    }
-
-    async fn server_ready(
-        &self,
-        _: Request<pb::ServerReadyRequest>,
-    ) -> Result<Response<pb::ServerReadyResponse>, Status> {
-        let any_healthy = {
-            let sched = self.inner.scheduler.lock().unwrap();
-            (0..sched.num_replicas()).any(|i| sched.is_healthy(i))
-        };
-        Ok(Response::new(pb::ServerReadyResponse {
-            ready: any_healthy,
-        }))
-    }
-
-    async fn model_metadata(
-        &self,
-        req: Request<pb::ModelMetadataRequest>,
-    ) -> Result<Response<pb::ModelMetadataResponse>, Status> {
-        // forward to first healthy replica
-        let idx = {
-            let sched = self.inner.scheduler.lock().unwrap();
-            (0..sched.num_replicas()).find(|&i| sched.is_healthy(i))
-        }
-        .ok_or_else(|| Status::unavailable("no healthy replicas"))?;
-        let mut client = self.inner.clients[idx].clone();
-        client.model_metadata(req.into_inner()).await
-    }
-
-    async fn model_infer(
-        &self,
-        request: Request<pb::ModelInferRequest>,
+        req: pb::ModelInferRequest,
     ) -> Result<Response<pb::ModelInferResponse>, Status> {
-        let req = request.into_inner();
         let text = RouterInner::extract_text(&req)?;
         let hashes = self.inner.hash_prompt(text)?;
         // `text` (and its borrow of `req`) isn't needed past this point.
@@ -237,15 +204,78 @@ impl GrpcInferenceService for RouterService {
             }
             Err(status) if is_transport_failure(&status) => {
                 self.inner.mark_unhealthy(decision.replica);
-                Err(status)
+                // Both attempts exhausted: report a single unavailable
+                // status summarizing the last failure rather than leaking
+                // the second replica's raw status code, so callers see
+                // "the router gave up" instead of an ambiguous per-replica
+                // error.
+                Err(Status::unavailable(format!(
+                    "all attempts failed: {}: {}",
+                    status.code(),
+                    status.message()
+                )))
             }
             Err(status) => Err(status), // app-level error: propagate
         }
+    }
+}
+
+#[tonic::async_trait]
+impl GrpcInferenceService for RouterService {
+    async fn server_live(
+        &self,
+        _: Request<pb::ServerLiveRequest>,
+    ) -> Result<Response<pb::ServerLiveResponse>, Status> {
+        Ok(Response::new(pb::ServerLiveResponse { live: true }))
+    }
+
+    async fn server_ready(
+        &self,
+        _: Request<pb::ServerReadyRequest>,
+    ) -> Result<Response<pb::ServerReadyResponse>, Status> {
+        let any_healthy = {
+            let sched = self.inner.scheduler.lock().unwrap();
+            (0..sched.num_replicas()).any(|i| sched.is_healthy(i))
+        };
+        Ok(Response::new(pb::ServerReadyResponse {
+            ready: any_healthy,
+        }))
+    }
+
+    async fn model_metadata(
+        &self,
+        req: Request<pb::ModelMetadataRequest>,
+    ) -> Result<Response<pb::ModelMetadataResponse>, Status> {
+        // forward to first healthy replica
+        let idx = {
+            let sched = self.inner.scheduler.lock().unwrap();
+            (0..sched.num_replicas()).find(|&i| sched.is_healthy(i))
+        }
+        .ok_or_else(|| Status::unavailable("no healthy replicas"))?;
+        let mut client = self.inner.clients[idx].clone();
+        client.model_metadata(req.into_inner()).await
+    }
+
+    async fn model_infer(
+        &self,
+        request: Request<pb::ModelInferRequest>,
+    ) -> Result<Response<pb::ModelInferResponse>, Status> {
+        let req = request.into_inner();
+        // Single parent span for the whole request so both attempts'
+        // `route_decision` / `upstream_infer` children are one trace.
+        let request_span = tracing::info_span!("model_infer", model = %req.model_name);
+        self.model_infer_attempts(req)
+            .instrument(request_span)
+            .await
     }
 
     type ModelStreamInferStream =
         Pin<Box<dyn Stream<Item = Result<pb::ModelStreamInferResponse, Status>> + Send>>;
 
+    // Deliberately unspanned: streaming requests are handled on a detached
+    // `tokio::spawn`ed task decoupled from this call's tracing context, and
+    // a single client stream can carry many independently-routed requests,
+    // so there's no one natural parent span to attach child spans to here.
     async fn model_stream_infer(
         &self,
         request: Request<Streaming<pb::ModelInferRequest>>,
@@ -374,36 +404,68 @@ impl GrpcInferenceService for RouterService {
 /// Probe `ServerLive` on every replica every `interval`, flipping each
 /// replica's health state in the scheduler and updating the
 /// `healthy_replicas` gauge. Runs until the process exits.
+///
+/// Replicas are probed concurrently (one spawned task per replica, each
+/// with its own 1s timeout) so total detection latency for a pass stays
+/// flat as replica count grows, instead of serializing up to
+/// `n * 1s` worst-case if probes ran one after another. Scheduler updates
+/// are applied afterwards under a single lock acquisition per pass rather
+/// than one per replica.
 pub fn spawn_health_prober(
     inner: Arc<RouterInner>,
     interval: std::time::Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
+        // Default (Burst) behavior fires back-to-back catch-up ticks after
+        // a slow pass (e.g. the process was stalled or a probe took a
+        // while); Delay just resumes on the normal cadence from whenever
+        // the tick actually fires, which is what we want for a periodic
+        // health check.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
             let n = inner.clients.len();
-            let mut healthy_count = 0i64;
+
+            let mut probes = tokio::task::JoinSet::new();
             for i in 0..n {
                 let mut client = inner.clients[i].clone();
-                let live = matches!(
-                    tokio::time::timeout(
-                        std::time::Duration::from_secs(1),
-                        client.server_live(pb::ServerLiveRequest {}),
-                    )
-                    .await,
-                    Ok(Ok(resp)) if resp.get_ref().live
-                );
+                probes.spawn(async move {
+                    let live = matches!(
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(1),
+                            client.server_live(pb::ServerLiveRequest {}),
+                        )
+                        .await,
+                        Ok(Ok(resp)) if resp.get_ref().live
+                    );
+                    (i, live)
+                });
+            }
+            let mut results = Vec::with_capacity(n);
+            while let Some(joined) = probes.join_next().await {
+                if let Ok(pair) = joined {
+                    results.push(pair);
+                }
+                // A `JoinError` here means the probe task panicked; skip it
+                // for this pass rather than poisoning the whole prober —
+                // it'll be probed again next tick.
+            }
+
+            let mut healthy_count = 0i64;
+            {
                 let mut sched = inner.scheduler.lock().unwrap();
-                if live {
-                    if !sched.is_healthy(i) {
-                        tracing::info!(replica = i, "replica re-admitted");
+                for (i, live) in results {
+                    if live {
+                        if !sched.is_healthy(i) {
+                            tracing::info!(replica = i, "replica re-admitted");
+                        }
+                        sched.mark_healthy(i);
+                        healthy_count += 1;
+                    } else if sched.is_healthy(i) {
+                        tracing::warn!(replica = i, "replica marked unhealthy");
+                        sched.mark_unhealthy(i);
                     }
-                    sched.mark_healthy(i);
-                    healthy_count += 1;
-                } else if sched.is_healthy(i) {
-                    tracing::warn!(replica = i, "replica marked unhealthy");
-                    sched.mark_unhealthy(i);
                 }
             }
             inner.metrics.healthy_replicas.set(healthy_count);
@@ -423,6 +485,23 @@ fn fmt_status(status: &Status) -> String {
 /// report the stream as canceled when the connection resets before the
 /// request completes. `Unknown` and `Internal` are included as other
 /// transport-shaped failure modes seen from broken/misbehaving peers.
+///
+/// `DeadlineExceeded` is deliberately NOT included here. The replica
+/// `Endpoint`s built in main.rs carry a per-request `timeout`; when that
+/// elapses the replica may well be alive and still doing real work on the
+/// request. Treating a deadline expiry as a transport failure and
+/// retrying it on another replica would risk *doubling* the compute cost
+/// of an already-expensive request instead of recovering from a dead
+/// peer, so it's surfaced to the caller as-is rather than triggering a
+/// retry.
+///
+/// Retry-safety caveat: every code matched below can also occur *after*
+/// the upstream has already started processing the request (e.g. the
+/// response was in flight when the connection reset), so a retry here can
+/// mean the same request is executed twice by two different replicas.
+/// That's an accepted tradeoff for this mock/demo router; a production
+/// router fronting a stateful backend would want idempotency keys on the
+/// request so a duplicate delivery is safe to detect and drop.
 fn is_transport_failure(status: &Status) -> bool {
     matches!(
         status.code(),

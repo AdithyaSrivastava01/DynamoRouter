@@ -27,6 +27,15 @@ struct RequestResult {
     total_blocks: i64,
 }
 
+/// Outcome of replaying one conversation's turns. `failed` is set when a
+/// turn errors and the conversation is abandoned (remaining turns never
+/// attempted) — at most one failed request per conversation, since replay
+/// stops at the first error rather than pressing on.
+struct ConvOutcome {
+    results: Vec<RequestResult>,
+    failed: bool,
+}
+
 fn infer_request(text: &str) -> pb::ModelInferRequest {
     pb::ModelInferRequest {
         model_name: "mock".into(),
@@ -80,6 +89,7 @@ async fn main() -> anyhow::Result<()> {
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
             let mut results = Vec::new();
+            let mut failed = false;
             for turn in &conv.turns {
                 let t0 = Instant::now();
                 match client.model_infer(infer_request(turn)).await {
@@ -93,17 +103,25 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Err(status) => {
                         eprintln!("conv {}: {status}", conv.id);
+                        failed = true;
                         break; // abandon conversation on error
                     }
                 }
             }
-            results
+            ConvOutcome { results, failed }
         }));
     }
 
     let mut all = Vec::new();
+    let mut failed_requests = 0u64;
+    let mut abandoned_conversations = 0u64;
     for h in handles {
-        all.extend(h.await?);
+        let outcome = h.await?;
+        if outcome.failed {
+            failed_requests += 1;
+            abandoned_conversations += 1;
+        }
+        all.extend(outcome.results);
     }
     let wall = start.elapsed().as_secs_f64();
 
@@ -124,5 +142,11 @@ async fn main() -> anyhow::Result<()> {
     println!("latency P50:     {:.1} ms", percentile(&latencies, 0.50));
     println!("latency P99:     {:.1} ms", percentile(&latencies, 0.99));
     println!("cache hit rate:  {hit_rate:.1}% ({cached}/{total} blocks)");
+    // Always printed, even when both counts are 0, so a clean run is
+    // provably clean rather than the absence of the line being ambiguous
+    // between "no errors" and "errors weren't checked".
+    println!(
+        "errors:          {failed_requests} requests failed, {abandoned_conversations} conversations abandoned"
+    );
     Ok(())
 }
