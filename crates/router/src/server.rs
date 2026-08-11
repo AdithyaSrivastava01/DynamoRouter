@@ -81,7 +81,7 @@ impl RouterInner {
         let tokens = self
             .tokenizer
             .tokenize(text)
-            .map_err(|e| Status::invalid_argument(format!("tokenize: {e}")))?;
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
         Ok(block_hashes(&tokens))
     }
 
