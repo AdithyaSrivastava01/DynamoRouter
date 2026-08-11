@@ -60,3 +60,51 @@ impl Default for Metrics {
         Self::new()
     }
 }
+
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+
+/// fmt logging always; OTel layer only when `OTEL_EXPORTER_OTLP_ENDPOINT`
+/// is set. Keeps tests/dev clean (no exporter, no network calls) while
+/// letting the docker-compose stack export to Jaeger by setting the env
+/// var.
+pub fn init_tracing() {
+    let fmt_layer = tracing_subscriber::fmt::layer();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    if let Ok(endpoint) = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT") {
+        // opentelemetry 0.27 / opentelemetry-otlp 0.27 API: `with_endpoint`
+        // lives on the `WithExportConfig` trait (must be imported), the
+        // provider type is `trace::TracerProvider` (not `SdkTracerProvider`
+        // — that name arrives in a later minor version), and
+        // `with_batch_exporter` takes an explicit runtime handle since the
+        // batch span processor needs somewhere to spawn its background
+        // flush task.
+        use opentelemetry_otlp::WithExportConfig;
+        let exporter = opentelemetry_otlp::SpanExporter::builder()
+            .with_tonic()
+            .with_endpoint(endpoint)
+            .build()
+            .expect("otlp exporter");
+        let provider = opentelemetry_sdk::trace::TracerProvider::builder()
+            .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+            .with_resource(opentelemetry_sdk::Resource::new(vec![
+                opentelemetry::KeyValue::new("service.name", "dynamorouter"),
+            ]))
+            .build();
+        use opentelemetry::trace::TracerProvider as _;
+        let tracer = provider.tracer("dynamorouter");
+        opentelemetry::global::set_tracer_provider(provider);
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt_layer)
+            .with(tracing_opentelemetry::layer().with_tracer(tracer))
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt_layer)
+            .init();
+    }
+}

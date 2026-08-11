@@ -35,7 +35,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init(); // Task 12 replaces this with router::telemetry::init_tracing()
+    router::telemetry::init_tracing();
     let args = Args::parse();
     anyhow::ensure!(!args.replicas.is_empty(), "need at least one replica URL");
 

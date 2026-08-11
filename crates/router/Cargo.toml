@@ -17,6 +17,10 @@ prometheus = { workspace = true }
 axum = { workspace = true }
 tokenizers = { workspace = true }
 rustc-hash = { workspace = true }
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
+tracing-opentelemetry = "0.28"
 
 [dev-dependencies]
 mock-triton = { path = "../mock-triton" }

@@ -8,6 +8,7 @@ use prometheus::IntGauge;
 use tokio_stream::Stream;
 use tonic::transport::Channel;
 use tonic::{Request, Response, Status, Streaming};
+use tracing::Instrument;
 
 use protocol::blocks::block_hashes;
 use protocol::pb;
@@ -187,9 +188,21 @@ impl GrpcInferenceService for RouterService {
         // `text` (and its borrow of `req`) isn't needed past this point.
 
         // Attempt 1.
-        let decision = self.inner.pick_replica(&hashes)?;
+        let decision = {
+            let span = tracing::info_span!("route_decision", attempt = 0);
+            let _g = span.enter();
+            self.inner.pick_replica(&hashes)?
+        };
+        let upstream_span = tracing::info_span!(
+            "upstream_infer",
+            replica = decision.replica,
+            matched_blocks = decision.matched_blocks
+        );
         let mut client = self.inner.clients[decision.replica].clone();
-        let result = client.model_infer(req.clone()).await;
+        let result = client
+            .model_infer(req.clone())
+            .instrument(upstream_span)
+            .await;
         self.inner.complete(decision.replica);
         match result {
             Ok(resp) => {
@@ -204,9 +217,18 @@ impl GrpcInferenceService for RouterService {
 
         // Attempt 2 (retry on another replica). This is the last attempt,
         // so `req` is moved instead of cloned.
-        let decision = self.inner.pick_replica(&hashes)?;
+        let decision = {
+            let span = tracing::info_span!("route_decision", attempt = 1);
+            let _g = span.enter();
+            self.inner.pick_replica(&hashes)?
+        };
+        let upstream_span = tracing::info_span!(
+            "upstream_infer",
+            replica = decision.replica,
+            matched_blocks = decision.matched_blocks
+        );
         let mut client = self.inner.clients[decision.replica].clone();
-        let result = client.model_infer(req).await;
+        let result = client.model_infer(req).instrument(upstream_span).await;
         self.inner.complete(decision.replica);
         match result {
             Ok(resp) => {
