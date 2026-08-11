@@ -15,11 +15,25 @@
 //! blocks in the chain get a strictly higher `seq`, so they are evicted
 //! before their shallower ancestors that share the same access time — the
 //! flat equivalent of leaf-first eviction in the old tree.
+//!
+//! Every touch pushes a new heap entry regardless of whether anything gets
+//! evicted, so hit-heavy traffic on a replica sitting under budget (or
+//! repeatedly re-touching the same blocks) would otherwise grow the heap
+//! without bound — `evict_to`'s pop loop only runs while over budget, and
+//! never runs at all for read-refresh-only traffic. `touch` guards against
+//! this by compacting (rebuilding the heap from the map, dropping all
+//! stale entries) whenever the heap outgrows the map by more than a
+//! constant factor, keeping heap size — and so amortized eviction cost —
+//! bounded by a constant multiple of `num_blocks()`.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 use rustc_hash::FxHashMap;
+
+/// Heap compaction fires once `heap.len() > 2 * map.len().max(COMPACT_FLOOR)`.
+/// The floor keeps small/empty caches from compacting on nearly every touch.
+const COMPACT_FLOOR: usize = 1024;
 
 pub struct PrefixCache {
     /// hash -> (last_access, seq): the current ground truth for a block.
@@ -74,7 +88,25 @@ impl PrefixCache {
             self.heap.push((Reverse(access), seq, h));
             touched += 1;
         }
+        self.compact_if_bloated();
         touched
+    }
+
+    /// Rebuild the heap from the map (dropping every stale entry) once the
+    /// heap has grown past a constant factor of the map size. The O(n)
+    /// rebuild is amortized over the >= n pushes required to bloat the
+    /// heap that far again, preserving amortized O(log n) eviction even
+    /// under hit-heavy or repeated-refresh traffic that `evict_to` alone
+    /// would never shrink.
+    fn compact_if_bloated(&mut self) {
+        let threshold = 2 * self.map.len().max(COMPACT_FLOOR);
+        if self.heap.len() > threshold {
+            self.heap = self
+                .map
+                .iter()
+                .map(|(&h, &(a, s))| (Reverse(a), s, h))
+                .collect();
+        }
     }
 
     /// Count of leading blocks present; refreshes access time (and
@@ -97,6 +129,13 @@ impl PrefixCache {
             .iter()
             .take_while(|h| self.map.contains_key(h))
             .count()
+    }
+
+    /// Current heap size — exposed for tests to assert compaction keeps it
+    /// bounded relative to `num_blocks()`.
+    #[cfg(test)]
+    fn heap_len(&self) -> usize {
+        self.heap.len()
     }
 
     /// Evict least-recently-used blocks until `num_blocks() <= budget`.
@@ -200,5 +239,27 @@ mod tests {
         assert_eq!(t.num_blocks(), 2);
         assert_eq!(t.lookup(&[5, 6]), 2);
         assert_eq!(t.lookup(&[1, 2, 3, 4]), 0);
+    }
+
+    #[test]
+    fn heap_stays_bounded_under_repeated_hit_workload() {
+        // Pure cache-hit traffic: the same 64-block chain, matched in full
+        // every time. num_blocks() never changes and never approaches any
+        // reasonable budget, so evict_to's pop loop never runs — without
+        // compaction, heap_len() grows by 64 on every single call, forever.
+        let mut t = PrefixCache::new();
+        let chain: Vec<u64> = (0..64u64).collect();
+        t.insert(&chain);
+        for _ in 0..5_000 {
+            assert_eq!(t.match_prefix(&chain), 64);
+        }
+        // Heap must stay within a small constant factor of the map size,
+        // not grow with the number of requests served.
+        assert!(
+            t.heap_len() <= 4 * t.num_blocks().max(1024),
+            "heap grew unbounded: heap_len={} num_blocks={}",
+            t.heap_len(),
+            t.num_blocks()
+        );
     }
 }
