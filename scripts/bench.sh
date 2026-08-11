@@ -13,6 +13,10 @@ cargo build --release -p loadgen
 
 run_policy() {
   local policy="$1"
+  echo "--- resetting mock replica caches before $policy ---"
+  docker compose -f docker/docker-compose.yml restart \
+    mock1 mock2 mock3 mock4 mock5 mock6 mock7 mock8
+  sleep 5
   echo "--- restarting router with POLICY=$policy ---"
   POLICY="$policy" docker compose -f docker/docker-compose.yml up -d --force-recreate router
   sleep 3

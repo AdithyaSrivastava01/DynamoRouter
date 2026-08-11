@@ -15,7 +15,6 @@ path = "src/main.rs"
 protocol = { path = "../protocol" }
 tokio = { workspace = true }
 tonic = { workspace = true }
-prost = { workspace = true }
 tokio-stream = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }

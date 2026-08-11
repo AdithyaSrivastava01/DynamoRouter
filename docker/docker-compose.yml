@@ -22,6 +22,7 @@ services:
       METRICS_PORT: "9100"
       REPLICAS: "http://mock1:8001,http://mock2:8001,http://mock3:8001,http://mock4:8001,http://mock5:8001,http://mock6:8001,http://mock7:8001,http://mock8:8001"
       POLICY: "${POLICY:-cache-aware}"
+      BLOCK_BUDGET: "4096"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4317"
     depends_on: [mock1, mock2, mock3, mock4, mock5, mock6, mock7, mock8]
 

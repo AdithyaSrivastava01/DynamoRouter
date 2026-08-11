@@ -7,7 +7,6 @@ edition = "2021"
 protocol = { path = "../protocol" }
 tokio = { workspace = true }
 tonic = { workspace = true }
-prost = { workspace = true }
 tokio-stream = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
