@@ -51,11 +51,26 @@ struct ReplicaState {
     healthy: bool,
 }
 
+/// Why [`Scheduler::pick`] could not route a request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PickError {
+    /// Every replica is currently marked unhealthy.
+    NoHealthyReplicas,
+    /// At least one replica is healthy, but every healthy replica is
+    /// already at `max_inflight` — routing exists, capacity doesn't.
+    AllSaturated,
+}
+
 /// The outcome of a single [`Scheduler::pick`] call.
 #[derive(Clone, Copy, Debug)]
 pub struct RouteDecision {
     pub replica: usize,
     pub matched_blocks: usize,
+    /// The chosen replica's in-flight count immediately after this pick
+    /// (i.e. it includes the request just routed). Lets callers update a
+    /// per-replica inflight gauge without taking the scheduler mutex a
+    /// second time.
+    pub inflight_after: usize,
 }
 
 pub struct Scheduler {
@@ -83,22 +98,32 @@ impl Scheduler {
         }
     }
 
-    /// Route one request. Returns `None` if every replica is unhealthy or
-    /// already at its `max_inflight` cap. On success, bumps the chosen
-    /// replica's inflight count — callers must pair this with exactly one
+    /// Route one request. Returns `Err(PickError::NoHealthyReplicas)` if
+    /// every replica is unhealthy, or `Err(PickError::AllSaturated)` if at
+    /// least one is healthy but all healthy replicas are at their
+    /// `max_inflight` cap. On success, bumps the chosen replica's inflight
+    /// count — callers must pair this with exactly one
     /// [`Scheduler::complete`] call for that replica.
-    pub fn pick(&mut self, hashes: &[u64]) -> Option<RouteDecision> {
+    pub fn pick(&mut self, hashes: &[u64]) -> Result<RouteDecision, PickError> {
         let n = self.replicas.len();
         let mut avail_mask = vec![false; n];
         let mut any_available = false;
+        let mut any_healthy = false;
         for (i, r) in self.replicas.iter().enumerate() {
-            if r.healthy && r.inflight < self.cfg.max_inflight {
-                avail_mask[i] = true;
-                any_available = true;
+            if r.healthy {
+                any_healthy = true;
+                if r.inflight < self.cfg.max_inflight {
+                    avail_mask[i] = true;
+                    any_available = true;
+                }
             }
         }
         if !any_available {
-            return None;
+            return Err(if any_healthy {
+                PickError::AllSaturated
+            } else {
+                PickError::NoHealthyReplicas
+            });
         }
 
         let (idx, matched) = match self.policy {
@@ -112,7 +137,12 @@ impl Scheduler {
                         break;
                     }
                 }
-                (idx?, 0)
+                // any_available is true, so the wrap-around scan above is
+                // guaranteed to land on some healthy-and-available replica.
+                (
+                    idx.expect("any_available guarantees a round-robin candidate"),
+                    0,
+                )
             }
             Policy::CacheAware => {
                 let available: Vec<usize> = (0..n).filter(|&i| avail_mask[i]).collect();
@@ -163,9 +193,11 @@ impl Scheduler {
             r.cache.evict_to(self.cfg.block_budget);
         }
         r.inflight += 1;
-        Some(RouteDecision {
+        let inflight_after = r.inflight;
+        Ok(RouteDecision {
             replica: idx,
             matched_blocks: matched,
+            inflight_after,
         })
     }
 
@@ -281,7 +313,7 @@ mod tests {
     }
 
     #[test]
-    fn all_replicas_at_cap_returns_none() {
+    fn all_replicas_at_cap_returns_all_saturated() {
         let cfg = SchedulerConfig {
             max_inflight: 1,
             ..Default::default()
@@ -289,7 +321,15 @@ mod tests {
         let mut s = Scheduler::new(2, Policy::CacheAware, cfg);
         s.pick(&[1, 2]).unwrap();
         s.pick(&[3, 4]).unwrap();
-        assert!(s.pick(&[5, 6]).is_none());
+        assert_eq!(s.pick(&[5, 6]).unwrap_err(), PickError::AllSaturated);
+    }
+
+    #[test]
+    fn no_healthy_replicas_returns_no_healthy_replicas_error() {
+        let mut s = sched(2, Policy::CacheAware);
+        s.mark_unhealthy(0);
+        s.mark_unhealthy(1);
+        assert_eq!(s.pick(&[1, 2]).unwrap_err(), PickError::NoHealthyReplicas);
     }
 
     #[test]

@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::sync::Mutex;
 
 use protocol::pb;
 use protocol::{GrpcInferenceServiceClient, GrpcInferenceServiceServer};
@@ -62,12 +61,12 @@ async fn spawn_router_with_cfg(
         clients.push(GrpcInferenceServiceClient::new(channel));
     }
     let svc = RouterService {
-        inner: Arc::new(RouterInner {
-            scheduler: Mutex::new(Scheduler::new(replica_urls.len(), policy, cfg)),
+        inner: Arc::new(RouterInner::new(
+            Scheduler::new(replica_urls.len(), policy, cfg),
             clients,
-            tokenizer: PromptTokenizer::from_file(TOKENIZER).unwrap(),
-            metrics: Metrics::new(),
-        }),
+            PromptTokenizer::from_file(TOKENIZER).unwrap(),
+            Metrics::new(),
+        )),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -184,7 +183,7 @@ async fn streaming_forwards_chunks() {
         );
         chunks.push(msg.infer_response.unwrap());
     }
-    assert_eq!(chunks.len(), 4); // MockConfig::default decode_chunks
+    assert_eq!(chunks.len(), MockConfig::default().decode_chunks);
     assert!(chunks
         .last()
         .unwrap()
