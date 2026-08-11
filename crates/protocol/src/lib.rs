@@ -27,6 +27,9 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert_eq!(req.inputs[0].contents.as_ref().unwrap().bytes_contents[0], b"hello");
+        assert_eq!(
+            req.inputs[0].contents.as_ref().unwrap().bytes_contents[0],
+            b"hello"
+        );
     }
 }

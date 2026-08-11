@@ -40,7 +40,9 @@ async fn main() -> anyhow::Result<()> {
         axum::routing::get(move || {
             let registry = registry.clone();
             async move {
-                TextEncoder::new().encode_to_string(&registry.gather()).unwrap_or_default()
+                TextEncoder::new()
+                    .encode_to_string(&registry.gather())
+                    .unwrap_or_default()
             }
         }),
     );

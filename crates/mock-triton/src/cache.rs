@@ -8,7 +8,11 @@ pub struct KvCacheSim {
 
 impl KvCacheSim {
     pub fn new(capacity: usize) -> Self {
-        Self { capacity, map: HashMap::new(), clock: 0 }
+        Self {
+            capacity,
+            map: HashMap::new(),
+            clock: 0,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -22,7 +26,10 @@ impl KvCacheSim {
     /// Returns count of leading blocks already cached, then caches all blocks.
     pub fn lookup_insert(&mut self, hashes: &[u64]) -> usize {
         self.clock += 1;
-        let cached = hashes.iter().take_while(|h| self.map.contains_key(h)).count();
+        let cached = hashes
+            .iter()
+            .take_while(|h| self.map.contains_key(h))
+            .count();
         for &h in hashes {
             self.map.insert(h, self.clock);
         }

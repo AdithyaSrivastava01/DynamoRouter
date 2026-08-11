@@ -29,7 +29,10 @@ mod tests {
         let a = tok.tokenize("The quick brown fox jumps over the lazy dog.");
         let b = tok.tokenize("The quick brown fox jumps over the lazy dog. And more text.");
         assert!(!a.is_empty());
-        assert_eq!(a, tok.tokenize("The quick brown fox jumps over the lazy dog."));
+        assert_eq!(
+            a,
+            tok.tokenize("The quick brown fox jumps over the lazy dog.")
+        );
         assert_eq!(b[..a.len()], a[..]); // BPE prefix stability at word boundary
     }
 }

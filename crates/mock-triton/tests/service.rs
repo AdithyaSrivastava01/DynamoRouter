@@ -36,7 +36,11 @@ fn infer_request(text: &str) -> pb::ModelInferRequest {
 }
 
 fn int64_param(resp: &pb::ModelInferResponse, name: &str) -> Option<i64> {
-    match resp.parameters.get(name).and_then(|p| p.parameter_choice.as_ref()) {
+    match resp
+        .parameters
+        .get(name)
+        .and_then(|p| p.parameter_choice.as_ref())
+    {
         Some(pb::infer_parameter::ParameterChoice::Int64Param(v)) => Some(*v),
         _ => None,
     }
@@ -44,22 +48,37 @@ fn int64_param(resp: &pb::ModelInferResponse, name: &str) -> Option<i64> {
 
 // Long repeated prefix so the prompt spans several 16-token blocks.
 fn long_prompt(suffix: &str) -> String {
-    format!("{} {suffix}", "The quick brown fox jumps over the lazy dog. ".repeat(30))
+    format!(
+        "{} {suffix}",
+        "The quick brown fox jumps over the lazy dog. ".repeat(30)
+    )
 }
 
 #[tokio::test]
 async fn server_live_reports_true() {
-    let cfg = MockConfig { tokenizer_path: TOKENIZER.into(), prefill_us_per_token: 0, ..Default::default() };
+    let cfg = MockConfig {
+        tokenizer_path: TOKENIZER.into(),
+        prefill_us_per_token: 0,
+        ..Default::default()
+    };
     let (url, _handle) = spawn_service(cfg).await;
     let mut client = GrpcInferenceServiceClient::connect(url).await.unwrap();
 
-    let resp = client.server_live(pb::ServerLiveRequest {}).await.unwrap().into_inner();
+    let resp = client
+        .server_live(pb::ServerLiveRequest {})
+        .await
+        .unwrap()
+        .into_inner();
     assert!(resp.live);
 }
 
 #[tokio::test]
 async fn model_infer_reports_cold_then_warm_cache() {
-    let cfg = MockConfig { tokenizer_path: TOKENIZER.into(), prefill_us_per_token: 0, ..Default::default() };
+    let cfg = MockConfig {
+        tokenizer_path: TOKENIZER.into(),
+        prefill_us_per_token: 0,
+        ..Default::default()
+    };
     let (url, _handle) = spawn_service(cfg).await;
     let mut client = GrpcInferenceServiceClient::connect(url).await.unwrap();
 
@@ -73,12 +92,17 @@ async fn model_infer_reports_cold_then_warm_cache() {
     assert!(total > 1, "prompt should span multiple 16-token blocks");
 
     let second = client
-        .model_infer(infer_request(&long_prompt("turn one and then some more words")))
+        .model_infer(infer_request(&long_prompt(
+            "turn one and then some more words",
+        )))
         .await
         .unwrap()
         .into_inner();
     let cached_second = int64_param(&second, "cached_blocks").unwrap();
-    assert!(cached_second > 0, "repeated prefix should hit the warm cache");
+    assert!(
+        cached_second > 0,
+        "repeated prefix should hit the warm cache"
+    );
 }
 
 #[tokio::test]
@@ -102,7 +126,11 @@ async fn model_stream_infer_emits_configured_chunk_count_with_params_on_last() {
         chunks.push(msg.unwrap());
     }
 
-    assert_eq!(chunks.len(), 3, "should emit exactly decode_chunks responses");
+    assert_eq!(
+        chunks.len(),
+        3,
+        "should emit exactly decode_chunks responses"
+    );
     for (i, chunk) in chunks.iter().enumerate() {
         assert!(chunk.error_message.is_empty());
         let infer_resp = chunk.infer_response.as_ref().unwrap();

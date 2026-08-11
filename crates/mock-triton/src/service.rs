@@ -47,9 +47,17 @@ impl MockMetrics {
             IntCounter::new("replica_cached_blocks_total", "blocks served from KV cache").unwrap();
         let total_blocks_total =
             IntCounter::new("replica_total_blocks_total", "total prompt blocks seen").unwrap();
-        registry.register(Box::new(cached_blocks_total.clone())).unwrap();
-        registry.register(Box::new(total_blocks_total.clone())).unwrap();
-        Self { registry, cached_blocks_total, total_blocks_total }
+        registry
+            .register(Box::new(cached_blocks_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(total_blocks_total.clone()))
+            .unwrap();
+        Self {
+            registry,
+            cached_blocks_total,
+            total_blocks_total,
+        }
     }
 }
 
@@ -187,7 +195,12 @@ impl GrpcInferenceService for MockTritonService {
         let req = request.into_inner();
         let text = Self::extract_text(&req)?;
         let (cached, total) = self.prefill(&text).await?;
-        Ok(Response::new(Self::make_response(&req, cached, total, "mock-completion")))
+        Ok(Response::new(Self::make_response(
+            &req,
+            cached,
+            total,
+            "mock-completion",
+        )))
     }
 
     type ModelStreamInferStream =
@@ -198,7 +211,8 @@ impl GrpcInferenceService for MockTritonService {
         request: Request<Streaming<pb::ModelInferRequest>>,
     ) -> Result<Response<Self::ModelStreamInferStream>, Status> {
         let mut inbound = request.into_inner();
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<pb::ModelStreamInferResponse, Status>>(16);
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<Result<pb::ModelStreamInferResponse, Status>>(16);
         let cfg = self.cfg.clone();
         let cache = Arc::clone(&self.cache);
         let tokenizer = Arc::clone(&self.tokenizer);
