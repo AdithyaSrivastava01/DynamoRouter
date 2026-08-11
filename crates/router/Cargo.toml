@@ -16,6 +16,7 @@ tracing-subscriber = { workspace = true }
 prometheus = { workspace = true }
 axum = { workspace = true }
 tokenizers = { workspace = true }
+rustc-hash = { workspace = true }
 
 [dev-dependencies]
 mock-triton = { path = "../mock-triton" }
