@@ -159,3 +159,35 @@ async fn saturated_replicas_reject_fast() {
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::ResourceExhausted);
 }
+
+#[tokio::test]
+async fn streaming_forwards_chunks() {
+    let (m1, _h1) = spawn_mock(0).await;
+    let (router_url, _rh) = spawn_router(&[m1], Policy::CacheAware).await;
+    let mut client = GrpcInferenceServiceClient::connect(router_url)
+        .await
+        .unwrap();
+
+    let outbound = tokio_stream::iter(vec![infer_request(&long_prompt("stream me"))]);
+    let mut inbound = client
+        .model_stream_infer(outbound)
+        .await
+        .unwrap()
+        .into_inner();
+
+    let mut chunks = Vec::new();
+    while let Some(msg) = inbound.message().await.unwrap() {
+        assert!(
+            msg.error_message.is_empty(),
+            "unexpected: {}",
+            msg.error_message
+        );
+        chunks.push(msg.infer_response.unwrap());
+    }
+    assert_eq!(chunks.len(), 4); // MockConfig::default decode_chunks
+    assert!(chunks
+        .last()
+        .unwrap()
+        .parameters
+        .contains_key("cached_blocks"));
+}

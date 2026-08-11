@@ -149,8 +149,90 @@ impl GrpcInferenceService for RouterService {
 
     async fn model_stream_infer(
         &self,
-        _request: Request<Streaming<pb::ModelInferRequest>>,
+        request: Request<Streaming<pb::ModelInferRequest>>,
     ) -> Result<Response<Self::ModelStreamInferStream>, Status> {
-        Err(Status::unimplemented("streaming lands in Task 10"))
+        let mut client_rx = request.into_inner();
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<Result<pb::ModelStreamInferResponse, Status>>(16);
+        let inner = Arc::clone(&self.inner);
+
+        tokio::spawn(async move {
+            use tokio_stream::StreamExt;
+            while let Some(msg) = client_rx.next().await {
+                let req = match msg {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        break;
+                    }
+                };
+                let text = match RouterInner::extract_text(&req) {
+                    Ok(t) => t,
+                    Err(status) => {
+                        let _ = tx
+                            .send(Ok(pb::ModelStreamInferResponse {
+                                error_message: status.to_string(),
+                                infer_response: None,
+                            }))
+                            .await;
+                        continue;
+                    }
+                };
+                let decision = match inner.route(&text) {
+                    Ok(d) => d,
+                    Err(status) => {
+                        let _ = tx
+                            .send(Ok(pb::ModelStreamInferResponse {
+                                error_message: status.to_string(),
+                                infer_response: None,
+                            }))
+                            .await;
+                        continue;
+                    }
+                };
+                let mut client = inner.clients[decision.replica].clone();
+                let upstream = client
+                    .model_stream_infer(tokio_stream::iter(vec![req]))
+                    .await;
+                match upstream {
+                    Ok(resp) => {
+                        let mut upstream_rx = resp.into_inner();
+                        loop {
+                            match upstream_rx.message().await {
+                                Ok(Some(chunk)) => {
+                                    if tx.send(Ok(chunk)).await.is_err() {
+                                        inner.complete(decision.replica);
+                                        return; // client gone
+                                    }
+                                }
+                                Ok(None) => break,
+                                Err(status) => {
+                                    let _ = tx
+                                        .send(Ok(pb::ModelStreamInferResponse {
+                                            error_message: format!("upstream: {status}"),
+                                            infer_response: None,
+                                        }))
+                                        .await;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(status) => {
+                        let _ = tx
+                            .send(Ok(pb::ModelStreamInferResponse {
+                                error_message: format!("upstream connect: {status}"),
+                                infer_response: None,
+                            }))
+                            .await;
+                    }
+                }
+                inner.complete(decision.replica);
+            }
+        });
+
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        )))
     }
 }
